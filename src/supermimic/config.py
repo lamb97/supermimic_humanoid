@@ -33,6 +33,7 @@ class EnvCfg:
     future_frames: int = 10
     compact_library: bool = False
     anchor_obs: bool = False
+    anchor_ori_only: bool = False  # with anchor_obs: keep only the 6D orientation (IMU-observable), drop the 3D position
 
 
 @dataclass

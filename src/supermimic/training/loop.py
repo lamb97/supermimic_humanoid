@@ -28,8 +28,9 @@ from supermimic.world_model.world_model import WorldModel
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
-        cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
+        cfg.policy.goal_dim = cfg.env.future_frames * 68 + ((6 if cfg.env.anchor_ori_only else 9) if cfg.env.anchor_obs else 0)
         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+        cfg.policy_trainer.anchor_ori_only = cfg.env.anchor_ori_only
         self.rank, local_rank, self.world = init_distributed()
         self.is_main = self.rank == 0
         if self.world > 1:
@@ -67,6 +68,7 @@ class Trainer:
                 replay_capacity=cfg.env.replay_capacity,
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
+                anchor_ori_only=cfg.env.anchor_ori_only,
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
