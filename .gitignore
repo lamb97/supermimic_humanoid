@@ -13,3 +13,6 @@ wandb/
 .pytest_cache/
 .ruff_cache/
 experiments/**/outputs/
+/deploy/
+/deploy_src/
+/venvs/
