@@ -100,8 +100,11 @@ class Trainer:
         self.iteration = 0
         self.num_updates = 0
         self._utd_acc = 0.0
+        self.update_start = cfg.schedule.warmup_iterations
         if cfg.resume is not None:
             self.load(cfg.resume)
+            # The replay buffer is not checkpointed: refill it completely before updating again.
+            self.update_start = self.iteration + cfg.env.replay_capacity
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -179,7 +182,7 @@ class Trainer:
             self.iteration += 1
 
             # ---------------- (2)+(3) updates at the configured update-to-data ratio
-            if self.iteration >= sch.warmup_iterations:
+            if self.iteration >= self.update_start:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
