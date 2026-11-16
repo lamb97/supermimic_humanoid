@@ -19,8 +19,8 @@ import torch
 from mjlab.managers.recorder_manager import RecorderTerm, RecorderTermCfg
 
 from supermimic.data.replay_buffer import ReplayBuffer
-from supermimic.envs.sim_context import XI_DIM, SimContext
-from supermimic.envs.state_io import STATE_DIM, StateIO
+from supermimic.envs.sim_context import SimContext
+from supermimic.envs.state_io import StateIO
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -30,14 +30,15 @@ class ReplayRecorder(RecorderTerm):
     def __init__(self, cfg: ReplayRecorderCfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
         p = cfg.params
-        self.state_io = StateIO(env)
-        self.ctx = SimContext(env, p["foot_geom_regex"], p.get("com_body_name", "torso_link"))
+        obj = p.get("object_entity")
+        self.state_io = StateIO(env, object_entity=obj)
+        self.ctx = SimContext(env, p["foot_geom_regex"], p.get("com_body_name", "torso_link"), object_entity=obj)
         self.command_name = p.get("command_name", "motion")
         self.action_name = p.get("action_name", "joint_pos")
         n = env.num_envs
-        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
-        self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
-        self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
+        self.buffer = ReplayBuffer(n, int(p["capacity"]), self.state_io.state_dim, 29, self.ctx.dim, env.device)
+        self.prev_s = torch.zeros(n, self.state_io.state_dim, device=env.device)
+        self.prev_xi = torch.zeros(n, self.ctx.dim, device=env.device)
         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
         self.prev_clip = torch.zeros(n, dtype=torch.long, device=env.device)
         self.ep_start = torch.ones(n, dtype=torch.bool, device=env.device)

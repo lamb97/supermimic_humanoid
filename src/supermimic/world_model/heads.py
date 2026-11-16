@@ -2,9 +2,9 @@
 
 Everything here is a pure differentiable function of the 71-d simulator state
 ``s = [qpos(36) | qvel(35)]`` (root position expressed relative to the env origin,
-see ``StateIO``), the previous clean action, the sim context ``xi`` and the
-reference frame, so the same code serves the simulator-side tests and the
-imagined rollouts.
+see ``StateIO``; with a box, its 13-d state appended), the previous clean action,
+the sim context ``xi`` and the reference frame, so the same code serves the
+simulator-side tests and the imagined rollouts.
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
-from supermimic.envs.mdp.rewards import TrackingRewardCfg, tracking_reward_terms
+from supermimic.envs import box as box_def
+from supermimic.envs.mdp.rewards import TrackingRewardCfg, box_reward_terms, tracking_reward_terms
 from supermimic.kinematics.g1_fk import G1Kinematics
 from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse
 
@@ -75,6 +76,8 @@ class ReferenceFrame:
     body_ang_vel_w: torch.Tensor  # (N, B, 3)
     root_pos_w: torch.Tensor  # (N, 3)
     root_quat_w: torch.Tensor  # (N, 4)
+    box_pos_w: torch.Tensor | None = None  # (N, 3) reference box
+    box_quat_w: torch.Tensor | None = None  # (N, 4)
 
 
 class AnalyticHeads:
@@ -97,9 +100,12 @@ class AnalyticHeads:
         self.soft_limits = soft_limits
         self.default_joint_pos = default_joint_pos
         self.reward_cfg = reward_cfg or TrackingRewardCfg()
+        self.has_box = self.reward_cfg.has_box
+        self.contact_idx = fk.body_indices(tuple(n for n, _ in box_def.CONTACT_POINTS))
+        self.contact_offsets = torch.tensor([o for _, o in box_def.CONTACT_POINTS], dtype=default_joint_pos.dtype, device=default_joint_pos.device)
 
     def robot_bodies(self, s: torch.Tensor) -> dict[str, torch.Tensor]:
-        out = self.fk(s[..., :36], s[..., 36:])
+        out = self.fk(s[..., :36], s[..., 36:71])
         idx = self.tracked_idx
         return {
             "pos": out["pos"][..., idx, :],
@@ -113,6 +119,14 @@ class AnalyticHeads:
     def reward(self, s_next: torch.Tensor, action: torch.Tensor, prev_action: torch.Tensor, ref: ReferenceFrame, bodies=None):
         """Reward r_{t+1} of reaching s_next (= s_{t+1}) under target frame g_t. Returns dict with 'total'."""
         b = bodies if bodies is not None else self.robot_bodies(s_next)
+        terms = self._tracking_terms(s_next, action, prev_action, ref, b)
+        if self.has_box:
+            box = box_reward_terms(s_next[..., 71:74], s_next[..., 74:78], ref.box_pos_w, ref.box_quat_w, self.reward_cfg)
+            terms["total"] = terms["total"] + box["box_pos"] + box["box_ori"]
+            terms.update(box)
+        return terms
+
+    def _tracking_terms(self, s_next, action, prev_action, ref: ReferenceFrame, b):
         return tracking_reward_terms(
             robot_body_pos_w=b["pos"],
             robot_body_quat_w=b["quat"],
@@ -131,16 +145,42 @@ class AnalyticHeads:
         )
 
     @staticmethod
-    def termination_features(root_pos: torch.Tensor, root_quat: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
-        """[height error, tilt error] (N, 2) — the quantities the paper thresholds (0.25 m, 0.8)."""
+    def termination_features(root_pos: torch.Tensor, root_quat: torch.Tensor, ref: ReferenceFrame, box_pos=None, box_quat=None) -> torch.Tensor:
+        """[height error, tilt error] (N, 2) — the quantities the paper thresholds (0.25 m, 0.8);
+        with a box also [box position error (m), box orientation error (rad)] (N, 4)."""
         g = torch.tensor([0.0, 0.0, -1.0], dtype=root_quat.dtype, device=root_quat.device).expand(root_quat.shape[:-1] + (3,))
         tilt = quat_apply_inverse(ref.root_quat_w, g)[..., 2] - quat_apply_inverse(root_quat, g)[..., 2]
         height = ref.root_pos_w[..., 2] - root_pos[..., 2]
-        return torch.stack([height, tilt], dim=-1)
+        feats = [height, tilt]
+        if box_pos is not None:
+            e_pos, e_ori = box_def.box_errors(box_pos, box_quat, ref.box_pos_w, ref.box_quat_w)
+            feats += [torch.sqrt(e_pos + 1e-12), torch.sqrt(e_ori + 1e-12)]
+        return torch.stack(feats, dim=-1)
+
+    def state_termination_features(self, s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+        box = (s[..., 71:74], s[..., 74:78]) if self.has_box else (None, None)
+        return self.termination_features(s[..., 0:3], s[..., 3:7], ref, *box)  # pelvis == free-joint root
 
     def terminated(self, s: torch.Tensor, ref: ReferenceFrame, height_thr: float = 0.25, tilt_thr: float = 0.8) -> torch.Tensor:
         f = self.termination_features(s[..., 0:3], s[..., 3:7], ref)  # pelvis == free-joint root
         return (f[..., 0].abs() > height_thr) | (f[..., 1].abs() > tilt_thr)
+
+    # ------------------------------------------------------------------ box
+
+    def box_obs(self, s: torch.Tensor) -> torch.Tensor:
+        """(N, 9) box pose in the robot pelvis frame (the policy's ``object`` observation)."""
+        return box_def.pose_in_frame(s[..., 0:3], s[..., 3:7], s[..., 71:74], s[..., 74:78])
+
+    @staticmethod
+    def box_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+        """Critic-only privileged box tracking error (N, 4)."""
+        return box_def.box_error_features(s[..., 71:74], s[..., 74:78], ref.box_pos_w, ref.box_quat_w, ref.root_quat_w)
+
+    def contact_geometry(self, s: torch.Tensor) -> torch.Tensor:
+        """(N, 12) hand / foot contact points relative to the box, box frame (world-model input feature)."""
+        out = self.fk(s[..., :36])
+        i = self.contact_idx
+        return box_def.contact_geometry(out["pos"][..., i, :], out["quat"][..., i, :], self.contact_offsets, s[..., 71:74], s[..., 74:78])
 
     @staticmethod
     def root_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:

@@ -8,6 +8,8 @@ functions work unchanged, plus:
 * ``root_*``      reference pelvis quantities for the paper's root terminations
 * ``clip_end``    (N,) True once the clip's last frame has been reached (time-out)
 * return-based reset sampling over 1 s bins of the whole library (plan D14)
+* with ``object_entity_name``: the object (box) is reset to its reference state together with the
+  robot, and ``ref_box_*`` / ``box_*`` / ``box_pose_b`` expose the reference and simulated box
 """
 
 from __future__ import annotations
@@ -57,6 +59,10 @@ class MultiClipMotionCommand(CommandTerm):
         )
         print(f"[INFO] {self.library.summary()}")
         lib = self.library
+        self.has_box = cfg.object_entity_name is not None
+        if self.has_box:
+            assert lib.has_object, "object_entity_name is set but the clips carry no object trajectory"
+            self.box: Entity = env.scene[cfg.object_entity_name]
 
         n = self.num_envs
         self.frame = torch.zeros(n, dtype=torch.long, device=self.device)
@@ -78,8 +84,9 @@ class MultiClipMotionCommand(CommandTerm):
         self._gamma_pow = cfg.gamma ** torch.arange(self.max_ep_steps, device=self.device, dtype=torch.float64)
         self.bootstrap_fn = None  # optional: env_ids -> value estimate for truncated episodes
 
-        for k in ("error_anchor_pos", "error_anchor_rot", "error_body_pos", "error_body_rot",
-                  "error_joint_pos", "error_joint_vel", "sampling_entropy", "episode_return_to_go"):
+        metric_names = ("error_anchor_pos", "error_anchor_rot", "error_body_pos", "error_body_rot",
+                        "error_joint_pos", "error_joint_vel", "sampling_entropy", "episode_return_to_go")
+        for k in metric_names + (("error_box_pos", "error_box_rot") if self.has_box else ()):
             self.metrics[k] = torch.zeros(n, device=self.device)
 
     # ------------------------------------------------------------------ reference (mjlab MotionCommand API)
@@ -88,6 +95,8 @@ class MultiClipMotionCommand(CommandTerm):
         """Cache the reference state / tracked-body states of the current target frames."""
         self._ref = self.library.ref(self.frame)
         self._bodies = self.library.bodies(self.frame)
+        if self.has_box:
+            self._obj = self.library.obj(self.frame)
 
     @property
     def command(self) -> torch.Tensor:
@@ -96,6 +105,35 @@ class MultiClipMotionCommand(CommandTerm):
     @property
     def goal(self) -> torch.Tensor:
         return self.library.goal_window(self.frame, self.cfg.future_frames)
+
+    def goal_with_object(self) -> torch.Tensor:
+        """(N, K*77) future-frame goal features including the reference box pose."""
+        return self.library.goal_window(self.frame, self.cfg.future_frames, with_object=True)
+
+    # ------------------------------------------------------------------ box
+
+    @property
+    def ref_box_pos_w(self) -> torch.Tensor:
+        return self._obj.pos_w + self._env.scene.env_origins
+
+    @property
+    def ref_box_quat_w(self) -> torch.Tensor:
+        return self._obj.quat_w
+
+    @property
+    def box_pos_w(self) -> torch.Tensor:
+        return self.box.data.root_link_pos_w
+
+    @property
+    def box_quat_w(self) -> torch.Tensor:
+        return self.box.data.root_link_quat_w
+
+    @property
+    def box_pose_b(self) -> torch.Tensor:
+        """(N, 9) simulated box pose in the robot root (pelvis) frame: [position, rot6d]."""
+        from supermimic.envs.box import pose_in_frame
+
+        return pose_in_frame(self.robot_root_pos_w, self.robot_root_quat_w, self.box_pos_w, self.box_quat_w)
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -188,6 +226,9 @@ class MultiClipMotionCommand(CommandTerm):
         self.metrics["error_body_rot"] = quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w).mean(-1)
         self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
+        if self.has_box:
+            self.metrics["error_box_pos"] = torch.norm(self.ref_box_pos_w - self.box_pos_w, dim=-1)
+            self.metrics["error_box_rot"] = quat_error_magnitude(self.ref_box_quat_w, self.box_quat_w)
 
     # ------------------------------------------------------------------ reward bookkeeping for the sampler
 
@@ -281,6 +322,13 @@ class MultiClipMotionCommand(CommandTerm):
         self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
         self.robot.reset(env_ids=env_ids)
 
+    def _write_box_reference_to_sim(self, env_ids: torch.Tensor, frame: torch.Tensor) -> None:
+        """Put the box at its reference state of ``frame`` (velocities in world frame)."""
+        o = self.library.obj(frame)
+        state = torch.cat([o.pos_w + self._env.scene.env_origins[env_ids], o.quat_w, o.lin_vel_w, o.ang_vel_w], dim=-1)
+        self.box.write_root_state_to_sim(state, env_ids=env_ids)
+        self.box.reset(env_ids=env_ids)
+
     def _resample_command(self, env_ids: torch.Tensor):
         # Episode bookkeeping for the envs being reset (terminal reward is already in reward_buf).
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -317,6 +365,8 @@ class MultiClipMotionCommand(CommandTerm):
             joint_pos = joint_pos + sample_uniform(lo, hi, joint_pos.shape, device=self.device)
 
         self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel)
+        if self.has_box:
+            self._write_box_reference_to_sim(env_ids, self.frame[env_ids])
 
     def update_relative_body_poses(self) -> None:
         nb = len(self.cfg.body_names)
@@ -358,6 +408,8 @@ class MultiClipMotionCommand(CommandTerm):
         self._write_reference_state_to_sim(
             env_ids, r.root_pos_w + self._env.scene.env_origins[env_ids], r.root_quat_w, r.root_lin_vel_w, r.root_ang_vel_w, r.joint_pos, r.joint_vel
         )
+        if self.has_box:
+            self._write_box_reference_to_sim(env_ids, frame)
 
     # ------------------------------------------------------------------ debug visualization (viewer only)
 
@@ -372,8 +424,12 @@ class MultiClipMotionCommand(CommandTerm):
             import copy
 
             m = copy.deepcopy(self._env.sim.mj_model)
+            # The box has no visual mesh: its collision geom is the one to draw as the reference box.
+            box_geoms = set(self.box.indexing.geom_ids.tolist()) if self.has_box else set()
             for gi in range(m.ngeom):
-                if m.geom_contype[gi] != 0 or m.geom_conaffinity[gi] != 0:
+                if gi in box_geoms:
+                    m.geom_rgba[gi] = (1.0, 0.55, 0.1, 0.35)
+                elif m.geom_contype[gi] != 0 or m.geom_conaffinity[gi] != 0:
                     m.geom_rgba[gi, 3] = 0  # hide collision geoms
                 else:
                     m.geom_rgba[gi] = (0.2, 0.6, 1.0, 0.45)
@@ -386,11 +442,18 @@ class MultiClipMotionCommand(CommandTerm):
         joint_pos = self.joint_pos.cpu().numpy()
         import numpy as np
 
+        if self.has_box:
+            box_q = self.box.indexing.free_joint_q_adr.cpu().numpy()
+            box_pos = self.ref_box_pos_w.cpu().numpy()
+            box_quat = self.ref_box_quat_w.cpu().numpy()
         for e in env_indices:
             qpos = np.zeros(self._ghost_model.nq)
             qpos[free_q[0:3]] = root_pos[e]
             qpos[free_q[3:7]] = root_quat[e]
             qpos[joint_q] = joint_pos[e]
+            if self.has_box:
+                qpos[box_q[0:3]] = box_pos[e]
+                qpos[box_q[3:7]] = box_quat[e]
             visualizer.add_ghost_mesh(qpos, model=self._ghost_model, label=f"ghost_{e}")
 
 
@@ -420,6 +483,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     max_logged_steps: int = 1024
     compact_library: bool = False
     library_fp16: bool = True
+    object_entity_name: str | None = None
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
 
     def build(self, env: ManagerBasedRlEnv) -> MultiClipMotionCommand:

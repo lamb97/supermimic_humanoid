@@ -8,7 +8,7 @@ import torch
 
 from supermimic.data.replay_buffer import StartBatch
 from supermimic.envs.mdp.motion_library import MotionLibrary
-from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagStep
+from supermimic.imagination.compiled import ImagStep
 from supermimic.policy.nets import Policy
 from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
 from supermimic.world_model.wm_trainer import reference_at
@@ -17,17 +17,18 @@ from supermimic.world_model.world_model import WorldModel
 # Paper Table A.1 sensor noise (uniform half-widths) in the 93-d observation order.
 OBS_NOISE_HALF = torch.tensor([0.01] * 29 + [0.5] * 29 + [0.2] * 3 + [0.05] * 3 + [0.0] * 29)
 ANCHOR_NOISE_HALF = torch.tensor([0.25] * 3 + [0.05] * 6)
+BOX_NOISE_HALF = 0.01  # same as the env's ``object`` group
 
 
 @dataclass
 class ImagRollout:
-    states: torch.Tensor  # (H+1, n, 71)
+    states: torch.Tensor  # (H+1, n, 71|84)
     actions: torch.Tensor  # (H, n, 29)
     rewards: torch.Tensor  # (H, n)      r_{t+1}
     dhat: torch.Tensor  # (H+1, n)    predicted termination prob of s_t (d_0 = 0)
     survival: torch.Tensor  # (H+1, n)    c_t
-    goals: torch.Tensor  # (H+1, n, 680)
-    e_root: torch.Tensor  # (H+1, n, 4)
+    goals: torch.Tensor  # (H+1, n, goal_dim)
+    e_root: torch.Tensor  # (H+1, n, 4|8) critic-only drift (+ box tracking error) features
     frames: torch.Tensor  # (H+1, n)
     reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
 
@@ -43,11 +44,13 @@ def imagine(
     step_fn: ImagStep | None = None,
     anchor_obs: bool = False,
     anchor_ori_only: bool = False,
+    policy_box_obs: bool = False,
 ) -> ImagRollout:
     device = start.state.device
     n = start.state.shape[0]
     q0 = lib.default_joint_pos
     step_fn = step_fn or ImagStep(wm, q0)
+    heads = wm.heads
     noise_half = OBS_NOISE_HALF.to(device)
     anchor_noise_half = ANCHOR_NOISE_HALF.to(device)
     if anchor_ori_only:
@@ -59,8 +62,19 @@ def imagine(
             return o + (torch.rand_like(o) * 2 - 1) * noise_half
         return o
 
+    def box_obs(o):
+        if obs_noise:
+            return o + (torch.rand_like(o) * 2 - 1) * BOX_NOISE_HALF
+        return o
+
+    def e_features(s_t, ref_t):
+        e = heads.root_error_features(s_t, ref_t)
+        if wm.has_box:
+            e = torch.cat([e, heads.box_error_features(s_t, ref_t)], dim=-1)
+        return e
+
     def make_goal(frame_t, ref_t, anchor_pose):
-        g = lib.goal_window(frame_t, future_frames)
+        g = lib.goal_window(frame_t, future_frames, with_object=policy_box_obs)
         if not anchor_obs:
             return g
         rel = anchor_relative_obs(anchor_pose[..., 0:3], anchor_pose[..., 3:7], ref_t.body_pos_w[..., ai, :], ref_t.body_quat_w[..., ai, :])
@@ -88,7 +102,8 @@ def imagine(
 
     def ref_at(t):
         sl = slice(t * n, (t + 1) * n)
-        return ReferenceFrame(ref_all.body_pos_w[sl], ref_all.body_quat_w[sl], ref_all.body_lin_vel_w[sl], ref_all.body_ang_vel_w[sl], ref_all.root_pos_w[sl], ref_all.root_quat_w[sl])
+        box = (ref_all.box_pos_w[sl], ref_all.box_quat_w[sl]) if ref_all.box_pos_w is not None else (None, None)
+        return ReferenceFrame(ref_all.body_pos_w[sl], ref_all.body_quat_w[sl], ref_all.body_lin_vel_w[sl], ref_all.body_ang_vel_w[sl], ref_all.root_pos_w[sl], ref_all.root_quat_w[sl], *box)
 
     ref = ref_at(0)
     if anchor_obs:
@@ -97,13 +112,16 @@ def imagine(
     else:
         anchor_pose = None
     goals = [make_goal(frame, ref, anchor_pose)]
-    e_roots = [wm.heads.root_error_features(s, ref)]
-    term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
+    e_roots = [e_features(s, ref)]
+    obj = box_obs(heads.box_obs(s)) if policy_box_obs else None
+    term_sum = torch.zeros(len(step_fn.term_names), device=device)
 
     for t in range(horizon):
         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
-        a = policy(obs_flat, goals[-1])
-        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
+        a = policy(obs_flat, goals[-1], obj)
+        s_next, r, term_vec, logits, obs_clean, anchor_pose, box_obs_clean = step_fn(s, a, a_prev, start.xi, ref)
+        if policy_box_obs:
+            obj = box_obs(box_obs_clean)
         d = torch.sigmoid(logits)
         c = c * (1.0 - d)
         term_sum += term_vec.detach().mean(-1)
@@ -119,7 +137,7 @@ def imagine(
         dhats.append(d)
         survivals.append(c)
         goals.append(make_goal(frame, ref, anchor_pose))
-        e_roots.append(wm.heads.root_error_features(s, ref))
+        e_roots.append(e_features(s, ref))
         frames.append(frame)
 
     return ImagRollout(
@@ -131,5 +149,5 @@ def imagine(
         goals=torch.stack(goals),
         e_root=torch.stack(e_roots),
         frames=torch.stack(frames),
-        reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
+        reward_terms={k: float(v / horizon) for k, v in zip(step_fn.term_names, term_sum.tolist())},
     )

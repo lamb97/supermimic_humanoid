@@ -27,7 +27,9 @@ class WMTrainerCfg:
 def reference_at(lib: MotionLibrary, frame: torch.Tensor) -> ReferenceFrame:
     r = lib.ref(frame)
     b = lib.bodies(frame)
-    return ReferenceFrame(b.pos_w, b.quat_w, b.lin_vel_w, b.ang_vel_w, r.root_pos_w, r.root_quat_w)
+    o = lib.obj(frame) if lib.has_object else None
+    return ReferenceFrame(b.pos_w, b.quat_w, b.lin_vel_w, b.ang_vel_w, r.root_pos_w, r.root_quat_w,
+                          o.pos_w if o is not None else None, o.quat_w if o is not None else None)
 
 
 class WorldModelTrainer:
@@ -44,9 +46,15 @@ class WorldModelTrainer:
 
     def loss_on(self, w: WindowBatch):
         k, n = w.frame.shape
-        # Only the root pose of the references is needed for the termination features.
+        # Only the root (and box) pose of the references is needed for the termination features.
         r = self.lib.ref(w.frame.reshape(-1))
-        refs = [ReferenceFrame(None, None, None, None, r.root_pos_w[j * n : (j + 1) * n], r.root_quat_w[j * n : (j + 1) * n]) for j in range(k)]
+        o = self.lib.obj(w.frame.reshape(-1)) if self.wm.has_box else None
+        sl = lambda x, j: None if x is None else x[j * n : (j + 1) * n]  # noqa: E731
+        refs = [
+            ReferenceFrame(None, None, None, None, sl(r.root_pos_w, j), sl(r.root_quat_w, j),
+                           sl(o.pos_w if o is not None else None, j), sl(o.quat_w if o is not None else None, j))
+            for j in range(k)
+        ]
         return self.wm.window_loss(w.states, w.a_exec, w.xi, w.done, refs)
 
     def update(self, buffer: ReplayBuffer) -> dict[str, float]:

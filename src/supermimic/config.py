@@ -34,6 +34,9 @@ class EnvCfg:
     compact_library: bool = False
     anchor_obs: bool = False
     anchor_ori_only: bool = False  # with anchor_obs: keep only the 6D orientation (IMU-observable), drop the 3D position
+    box: bool = False  # OmniRetarget large box: scene, world model state, rewards, box termination
+    policy_box_obs: bool = False  # with box: the policy sees the box pose and the reference box trajectory
+    box_term_start_step: int = 10000  # env steps before the box termination switches on
 
 
 @dataclass

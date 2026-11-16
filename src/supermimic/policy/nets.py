@@ -27,6 +27,8 @@ class PolicyCfg:
     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
+    goal_obj_per_frame: int = 0  # 9 when every goal frame carries the reference box pose (77 per frame)
+    obj_dim: int = 0  # measured object observation fed to the decoder next to the proprioception (9 for the box)
 
 
 @dataclass
@@ -43,8 +45,8 @@ def _obs_scale_vector(cfg: PolicyCfg) -> torch.Tensor:
 
 def _goal_scale_vector(cfg: PolicyCfg, goal_dim: int) -> torch.Tensor:
     sizes = (29, 29, 3, 3, 3, 1)
-    per_frame = torch.cat([torch.full((n,), 1.0 / s) for n, s in zip(sizes, cfg.goal_term_scale)])
-    k, extra = divmod(goal_dim, 68)
+    per_frame = torch.cat([torch.full((n,), 1.0 / s) for n, s in zip(sizes, cfg.goal_term_scale)] + [torch.ones(cfg.goal_obj_per_frame)])
+    k, extra = divmod(goal_dim, 68 + cfg.goal_obj_per_frame)
     return torch.cat([per_frame.repeat(k), torch.ones(extra)])
 
 
@@ -62,15 +64,16 @@ class MotionEncoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
         super().__init__()
-        self.mlp = MLP(cfg.latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
-        self.register_buffer("scale", _obs_scale_vector(cfg))
+        self.mlp = MLP(cfg.latent_dim + obs_dim + cfg.obj_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
+        self.register_buffer("scale", torch.cat([_obs_scale_vector(cfg), torch.ones(cfg.obj_dim)]))
 
-    def forward(self, z: torch.Tensor, obs_hist: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([z, obs_hist * self.scale], dim=-1))
+    def forward(self, z: torch.Tensor, obs_hist: torch.Tensor, obj: torch.Tensor | None = None) -> torch.Tensor:
+        obs = obs_hist if obj is None else torch.cat([obs_hist, obj], dim=-1)
+        return self.mlp(torch.cat([z, obs * self.scale], dim=-1))
 
 
 class Policy(nn.Module):
-    """a = dec(enc_motion(g), o_hist). Extra goal interfaces can be registered later (plan Appendix B)."""
+    """a = dec(enc_motion(g), o_hist[, o_obj]). Extra goal interfaces can be registered later (plan Appendix B)."""
 
     def __init__(self, cfg: PolicyCfg):
         super().__init__()
@@ -78,18 +81,18 @@ class Policy(nn.Module):
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
         self.decoder = Decoder(cfg)
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion") -> torch.Tensor:
-        return self.decoder(self.encoders[interface](goal), obs_hist)
+    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, obj: torch.Tensor | None = None, interface: str = "motion") -> torch.Tensor:
+        return self.decoder(self.encoders[interface](goal), obs_hist, obj)
 
 
 class Critic(nn.Module):
-    """V(canonical state 71, goal 680, xi 33, root error 4) -> scalar (one per interface)."""
+    """V(world-model features 71|98, goal, xi 33|35, root (+ box) error 4|8) -> scalar (one per interface)."""
 
-    def __init__(self, cfg: CriticCfg, feat_dim: int = 71, goal_dim: int | None = None, xi_dim: int = 33, pcfg: PolicyCfg | None = None):
+    def __init__(self, cfg: CriticCfg, feat_dim: int = 71, goal_dim: int | None = None, xi_dim: int = 33, pcfg: PolicyCfg | None = None, err_dim: int = 4):
         super().__init__()
         pcfg = pcfg or PolicyCfg()
         goal_dim = goal_dim or pcfg.goal_dim
-        self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4, cfg.hidden, 1)
+        self.mlp = MLP(feat_dim + goal_dim + xi_dim + err_dim, cfg.hidden, 1)
         self.register_buffer("goal_scale", _goal_scale_vector(pcfg, goal_dim))
 
     def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor) -> torch.Tensor:

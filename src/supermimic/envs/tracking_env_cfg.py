@@ -9,13 +9,22 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
   * terminations: pelvis height / tilt vs reference, no end-effector term, clip-end time-out;
   * events: no push; friction and encoder bias re-sampled per episode; COM at startup;
   * a ``ReplayRecorder`` streams transitions into a GPU replay buffer.
+
+``box=True`` adds the OmniRetarget large box (``supermimic.envs.box``): reset to its reference state with the
+robot, mass (startup, U[0.5, 1.0] kg) and friction (per episode) randomized, box tracking rewards, and a box
+termination that switches on after ``box_term_start_step`` env steps. ``policy_box_obs=True`` additionally
+gives the policy the box pose in its pelvis frame (``object`` group) and the reference box pose of every goal
+frame; with it False the policy is a pure motion tracker while the world model and critic still see the box.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import math
+
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as base_mdp
 from mjlab.envs.mdp import dr
@@ -32,8 +41,10 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 from supermimic.data.recorder import ReplayRecorderCfg
+from supermimic.envs import box as box_def
 from supermimic.envs.actions import NoisyJointPositionActionCfg
 from supermimic.envs.mdp import observations as sm_obs
+from supermimic.envs.mdp import rewards as sm_rew
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
 
@@ -89,6 +100,13 @@ class SuperMimicEnvCfgArgs:
     compact_library: bool = False
     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
     anchor_ori_only: bool = False  # with anchor_obs: orientation only (6), no state-estimated position
+    box: bool = False  # OmniRetarget large box in the scene, world model and rewards
+    policy_box_obs: bool = False  # with box: the policy observes the box (pelvis-frame pose + reference box goal)
+    box_term_start_step: int = 10000  # env steps before the box termination switches on (0 = always on)
+    box_term_pos: float = 1.0  # OmniRetarget: 1.0 m / 45 deg
+    box_term_ori: float = math.pi / 4
+    box_mass_range: tuple[float, float] = (0.5, 1.0)
+    box_friction_range: tuple[float, float] = (0.6, 1.0)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
     extra_command_kwargs: dict = field(default_factory=dict)
 
@@ -113,7 +131,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         ),
         "goal": ObservationGroupCfg(
             terms={
-                "future_frames": ObservationTermCfg(func=sm_obs.goal_future_frames, params={"command_name": "motion"}),
+                "future_frames": ObservationTermCfg(func=sm_obs.goal_future_frames, params={"command_name": "motion", "with_object": a.policy_box_obs}),
                 **(
                     {
                         **(
@@ -131,6 +149,14 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             enable_corruption=a.obs_noise,
         ),
     }
+    assert a.box or not a.policy_box_obs, "policy_box_obs needs box"
+    if a.policy_box_obs:
+        # Motion-capture-level noise on the measured box pose: 1 cm, ~1 deg on the rotation matrix entries.
+        observations["object"] = ObservationGroupCfg(
+            terms={"box_pose_b": ObservationTermCfg(func=sm_obs.box_pose_b, params={"command_name": "motion"}, noise=noise(-0.01, 0.01))},
+            concatenate_terms=True,
+            enable_corruption=a.obs_noise,
+        )
 
     # ---------------------------------------------------------------- actions
     actions = {
@@ -160,6 +186,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             joint_position_range=(-0.1, 0.1) if a.reset_noise else (0.0, 0.0),
             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
             compact_library=a.compact_library,
+            object_entity_name=box_def.BOX_ENTITY if a.box else None,
             debug_vis=a.debug_vis,
             **a.extra_command_kwargs,
         )
@@ -204,6 +231,23 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
                 "shared_random": True,
             },
         )
+    if a.box:
+        box_geom = SceneEntityCfg(box_def.BOX_ENTITY, geom_names=(box_def.BOX_GEOM,))
+        if a.domain_randomization:
+            # Mass and inertia scale together by exp(2 alpha): log-uniform mass over box_mass_range.
+            lo, hi = (0.5 * math.log(m / box_def.BOX_NOMINAL_MASS) for m in a.box_mass_range)
+            events["box_mass"] = EventTermCfg(
+                mode="startup",
+                func=dr.pseudo_inertia,
+                params={"asset_cfg": SceneEntityCfg(box_def.BOX_ENTITY, body_names=(box_def.BOX_BODY,)), "alpha_range": (lo, hi)},
+            )
+            events["box_friction"] = EventTermCfg(
+                mode="reset", func=dr.geom_friction, params={"asset_cfg": box_geom, "operation": "abs", "ranges": a.box_friction_range}
+            )
+        else:
+            # Expand the box friction per world at the nominal value so the sim context reads the same layout.
+            nominal = (box_def.BOX_NOMINAL_FRICTION, box_def.BOX_NOMINAL_FRICTION)
+            events["box_friction"] = EventTermCfg(mode="startup", func=dr.geom_friction, params={"asset_cfg": box_geom, "operation": "abs", "ranges": nominal})
 
     # ---------------------------------------------------------------- rewards (Table A.2)
     rewards = {
@@ -216,6 +260,10 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "action_rate_l2": RewardTermCfg(func=base_mdp.action_rate_l2, weight=-0.1),
         "joint_limit": RewardTermCfg(func=base_mdp.joint_pos_limits, weight=a.joint_limit_weight, params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))}),
     }
+    if a.box:
+        rcfg = sm_rew.TrackingRewardCfg(has_box=True)
+        rewards["box_pos"] = RewardTermCfg(func=sm_rew.box_position_error_exp, weight=rcfg.w_box_pos, params={"command_name": "motion", "std": rcfg.std_box_pos})
+        rewards["box_ori"] = RewardTermCfg(func=sm_rew.box_orientation_error_exp, weight=rcfg.w_box_ori, params={"command_name": "motion", "std": rcfg.std_box_ori})
 
     # ---------------------------------------------------------------- terminations
     terminations = {
@@ -224,13 +272,28 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "root_height": TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold}),
         "root_tilt": TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold}),
     }
+    if a.box:
+        terminations["box"] = TerminationTermCfg(
+            func=sm_term.bad_box,
+            params={"command_name": "motion", "pos_threshold": a.box_term_pos, "ori_threshold": a.box_term_ori, "start_step": a.box_term_start_step},
+        )
 
     recorders = {}
     if a.record_transitions:
-        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
+        recorders["replay"] = ReplayRecorderCfg(
+            params={
+                "capacity": a.replay_capacity,
+                "foot_geom_regex": FOOT_GEOM_REGEX,
+                "com_body_name": "torso_link",
+                "object_entity": box_def.BOX_ENTITY if a.box else None,
+            }
+        )
 
+    entities = {"robot": get_g1_robot_cfg()}
+    if a.box:
+        entities[box_def.BOX_ENTITY] = EntityCfg(spec_fn=box_def.get_box_spec)
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities=entities),
         observations=observations,
         actions=actions,
         commands=commands,
@@ -239,7 +302,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         terminations=terminations,
         recorders=recorders,
         viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name="torso_link", distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
-        sim=QuietSimulationCfg(nconmax=35, njmax=250, mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20)),
+        # The box adds box-floor (up to 4), box-hand and box-foot contacts per world.
+        sim=QuietSimulationCfg(nconmax=64 if a.box else 35, njmax=500 if a.box else 250, mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20)),
         decimation=4,
         episode_length_s=a.episode_length_s,
         seed=a.seed,

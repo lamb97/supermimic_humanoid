@@ -29,3 +29,18 @@ def bad_root_tilt(env: ManagerBasedRlEnv, command_name: str, threshold: float = 
 def clip_end(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
     cmd = cast(MultiClipMotionCommand, env.command_manager.get_term(command_name))
     return cmd.clip_end
+
+
+def bad_box(env: ManagerBasedRlEnv, command_name: str, pos_threshold: float = 1.0, ori_threshold: float = 0.785, start_step: int = 0) -> torch.Tensor:
+    """Box deviates from its reference by more than pos_threshold (m) or ori_threshold (rad).
+
+    OmniRetarget applies the object criterion only once body tracking is reasonable: it stays off for the
+    first ``start_step`` vectorised env steps (holosoma multi-task lesson: without the gate episodes
+    collapse to ~22 steps because the box is dropped long before the body can track)."""
+    cmd = cast(MultiClipMotionCommand, env.command_manager.get_term(command_name))
+    if env.common_step_counter < start_step:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    from supermimic.envs.box import box_errors
+
+    e_pos, e_ori = box_errors(cmd.box_pos_w, cmd.box_quat_w, cmd.ref_box_pos_w, cmd.ref_box_quat_w)
+    return (e_pos > pos_threshold**2) | (e_ori > ori_threshold**2)

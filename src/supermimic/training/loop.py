@@ -14,6 +14,7 @@ from supermimic.config import TrainConfig
 from supermimic.data.motion_convert import load_g1_model
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
+from supermimic.envs.mdp.rewards import TrackingRewardCfg
 from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
@@ -28,9 +29,15 @@ from supermimic.world_model.world_model import WorldModel
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
-        cfg.policy.goal_dim = cfg.env.future_frames * 68 + ((6 if cfg.env.anchor_ori_only else 9) if cfg.env.anchor_obs else 0)
+        assert cfg.env.box or not cfg.env.policy_box_obs, "policy_box_obs needs box"
+        obj_per_frame = 9 if cfg.env.policy_box_obs else 0
+        cfg.policy.goal_obj_per_frame = obj_per_frame
+        cfg.policy.obj_dim = 9 if cfg.env.policy_box_obs else 0
+        cfg.policy.goal_dim = cfg.env.future_frames * (68 + obj_per_frame) + ((6 if cfg.env.anchor_ori_only else 9) if cfg.env.anchor_obs else 0)
         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
         cfg.policy_trainer.anchor_ori_only = cfg.env.anchor_ori_only
+        cfg.policy_trainer.policy_box_obs = cfg.env.policy_box_obs
+        cfg.world_model.state_spec.has_box = cfg.env.box
         self.rank, local_rank, self.world = init_distributed()
         self.is_main = self.rank == 0
         if self.world > 1:
@@ -69,6 +76,9 @@ class Trainer:
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
                 anchor_ori_only=cfg.env.anchor_ori_only,
+                box=cfg.env.box,
+                policy_box_obs=cfg.env.policy_box_obs,
+                box_term_start_step=cfg.env.box_term_start_step,
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
@@ -81,10 +91,14 @@ class Trainer:
         robot = env.scene["robot"]
 
         fk = G1Kinematics(load_g1_model(), device=self.device)
-        heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
+        heads = AnalyticHeads(
+            fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone(),
+            reward_cfg=TrackingRewardCfg(has_box=cfg.env.box),
+        )
         self.wm = WorldModel(cfg.world_model, heads, self.device)
         self.policy = Policy(cfg.policy).to(self.device)
-        self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
+        self.critic = Critic(cfg.critic, feat_dim=self.wm.feat_dim, xi_dim=self.wm.spec.xi_dim, pcfg=cfg.policy, err_dim=8 if cfg.env.box else 4).to(self.device)
+        assert self.buffer.s.shape[-1] == self.wm.spec.state_dim and self.buffer.xi.shape[-1] == self.wm.spec.xi_dim, "replay buffer / world model dims differ"
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
@@ -100,8 +114,11 @@ class Trainer:
         self.iteration = 0
         self.num_updates = 0
         self._utd_acc = 0.0
+        self.update_start = cfg.schedule.warmup_iterations
         if cfg.resume is not None:
             self.load(cfg.resume)
+            # The replay buffer is not checkpointed: refill it completely before updating again.
+            self.update_start = self.iteration + cfg.env.replay_capacity
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -143,7 +160,7 @@ class Trainer:
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
-        return self.policy(obs["policy"], obs["goal"])
+        return self.policy(obs["policy"], obs["goal"], obs["object"] if "object" in obs else None)
 
     def run(self) -> None:
         cfg = self.cfg
@@ -179,7 +196,7 @@ class Trainer:
             self.iteration += 1
 
             # ---------------- (2)+(3) updates at the configured update-to-data ratio
-            if self.iteration >= sch.warmup_iterations:
+            if self.iteration >= self.update_start:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
@@ -244,6 +261,9 @@ class Trainer:
                     self.writer.add_scalar("time/updates", self.num_updates, it)
                     self.writer.add_scalar("sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it)
                     self.writer.add_scalar("sampler/bin_return_mean", float(self.command.bin_return.mean()), it)
+                    if cfg.env.box:
+                        self.writer.add_scalar("train/box_pos_err", float(self.command.metrics["error_box_pos"].mean()), it)
+                        self.writer.add_scalar("train/box_rot_err", float(self.command.metrics["error_box_rot"].mean()), it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     msg = (

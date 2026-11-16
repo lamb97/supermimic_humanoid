@@ -37,10 +37,23 @@ class TrackingRewardCfg:
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
     dt: float = 0.02
+    # Box tracking (holosoma's OmniRetarget object terms): global position / orientation of the box.
+    has_box: bool = False
+    std_box_pos: float = 0.3
+    std_box_ori: float = 0.4
+    w_box_pos: float = 1.0
+    w_box_ori: float = 1.0
 
     @property
     def max_step_reward(self) -> float:
-        return self.dt * (self.w_body_pos + self.w_body_ori + self.w_body_lin_vel + self.w_body_ang_vel + self.w_root_pos + self.w_root_ori)
+        box = (self.w_box_pos + self.w_box_ori) if self.has_box else 0.0
+        return self.dt * (self.w_body_pos + self.w_body_ori + self.w_body_lin_vel + self.w_body_ang_vel + self.w_root_pos + self.w_root_ori + box)
+
+    @property
+    def term_names(self) -> tuple[str, ...]:
+        names = ("motion_global_root_pos", "motion_global_root_ori", "motion_body_pos", "motion_body_ori",
+                 "motion_body_lin_vel", "motion_body_ang_vel", "action_rate_l2", "joint_limit")
+        return names + (("box_pos", "box_ori") if self.has_box else ())
 
 
 def reanchor_reference(
@@ -126,3 +139,31 @@ def tracking_reward_terms(
             total = total + v
     terms["total"] = total
     return terms
+
+
+def box_reward_terms(box_pos: torch.Tensor, box_quat: torch.Tensor, ref_pos: torch.Tensor, ref_quat: torch.Tensor, cfg: TrackingRewardCfg) -> dict[str, torch.Tensor]:
+    """Weighted, dt-scaled box tracking terms (N,): exp(-|dp|^2 / std^2), exp(-angle^2 / std^2)."""
+    from supermimic.envs.box import box_errors
+
+    e_pos, e_ori = box_errors(box_pos, box_quat, ref_pos, ref_quat)
+    return {
+        "box_pos": cfg.dt * cfg.w_box_pos * torch.exp(-e_pos / cfg.std_box_pos**2),
+        "box_ori": cfg.dt * cfg.w_box_ori * torch.exp(-e_ori / cfg.std_box_ori**2),
+    }
+
+
+def box_position_error_exp(env, command_name: str, std: float) -> torch.Tensor:
+    """mjlab reward term (unweighted, not dt-scaled; the reward manager applies both)."""
+    from supermimic.envs.box import box_errors
+
+    cmd = env.command_manager.get_term(command_name)
+    e_pos, _ = box_errors(cmd.box_pos_w, cmd.box_quat_w, cmd.ref_box_pos_w, cmd.ref_box_quat_w)
+    return torch.exp(-e_pos / std**2)
+
+
+def box_orientation_error_exp(env, command_name: str, std: float) -> torch.Tensor:
+    from supermimic.envs.box import box_errors
+
+    cmd = env.command_manager.get_term(command_name)
+    _, e_ori = box_errors(cmd.box_pos_w, cmd.box_quat_w, cmd.ref_box_pos_w, cmd.ref_box_quat_w)
+    return torch.exp(-e_ori / std**2)

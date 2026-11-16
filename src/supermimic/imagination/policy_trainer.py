@@ -36,6 +36,7 @@ class PolicyTrainerCfg:
     compile: str | None = "default"
     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
     anchor_ori_only: bool = False
+    policy_box_obs: bool = False
 
 
 class PolicyTrainer:
@@ -55,7 +56,7 @@ class PolicyTrainer:
 
     def _critic_inputs(self, ro: ImagRollout):
         H1, n, _ = ro.states.shape
-        feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
+        feat = self.wm.features(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
         return feat, ro.goals, ro.e_root
 
     def update(self, buffer: ReplayBuffer, xi_norm_fn=None) -> dict[str, float]:
@@ -66,7 +67,7 @@ class PolicyTrainer:
         # ---- actor: BPTT through the frozen world model ------------------------------------
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_ori_only=cfg.anchor_ori_only)
+        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, anchor_ori_only=cfg.anchor_ori_only, policy_box_obs=cfg.policy_box_obs)
         feat, goals, e_root = self._critic_inputs(ro)
         if cfg.use_critic:
             v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
@@ -106,7 +107,7 @@ class PolicyTrainer:
                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])
                 X_goal = goals_d[:-1].reshape(-1, goals_d.shape[-1])
                 X_xi = xi_rep[:-1].reshape(-1, xi_rep.shape[-1])
-                X_er = e_root_d[:-1].reshape(-1, 4)
+                X_er = e_root_d[:-1].reshape(-1, e_root_d.shape[-1])
                 Y = targets.reshape(-1)
             N = Y.shape[0]
             mb = N // cfg.critic_minibatches

@@ -18,6 +18,11 @@ Goal features (per frame, 68-d, plan D5):
   [joint_pos - q0 (29), joint_vel (29), projected gravity of the ref root (3),
    ref root angular velocity in the root frame (3),
    ref root linear velocity in the ref heading frame (3), ref root height (1)]
+
+Clips with an object (``object_pos_w`` etc. in the npz, full mode only) also carry the object
+reference trajectory and a 9-d per-frame object goal feature: the reference object pose in the
+reference root frame [position (3), rot6d (6)] -- reference-intrinsic, so it can be baked into a
+deployed policy like the 68-d features.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import torch
 from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse, yaw_quat
 
 GOAL_FEAT_DIM = 68
+OBJ_GOAL_FEAT_DIM = 9
 REF_DIM = 71
 
 
@@ -63,6 +69,14 @@ class RefBodies:
     ang_vel_w: torch.Tensor  # (N,B,3)
 
 
+@dataclass
+class RefObject:
+    pos_w: torch.Tensor  # (N,3)
+    quat_w: torch.Tensor  # (N,4) wxyz
+    lin_vel_w: torch.Tensor  # (N,3)
+    ang_vel_w: torch.Tensor  # (N,3) world
+
+
 def goal_features(ref: RefState, default_joint_pos: torch.Tensor) -> torch.Tensor:
     q = ref.root_quat_w
     grav = projected_gravity(q)
@@ -70,6 +84,12 @@ def goal_features(ref: RefState, default_joint_pos: torch.Tensor) -> torch.Tenso
     lin_h = quat_apply_inverse(yaw_quat(q), ref.root_lin_vel_w)
     height = ref.root_pos_w[..., 2:3]
     return torch.cat([ref.joint_pos - default_joint_pos, ref.joint_vel, grav, ang_b, lin_h, height], dim=-1)
+
+
+def object_goal_features(ref: RefState, obj: RefObject) -> torch.Tensor:
+    from supermimic.envs.box import pose_in_frame
+
+    return pose_in_frame(ref.root_pos_w, ref.root_quat_w, obj.pos_w, obj.quat_w)
 
 
 class MotionLibrary:
@@ -102,6 +122,7 @@ class MotionLibrary:
         body_idx = root_idx = None
         ref_chunks: list[np.ndarray] = []
         body_chunks = {"pos": [], "quat": [], "lin": [], "ang": []}
+        obj_chunks: list[np.ndarray] = []
         # A single packed cache (build_library.py) can stand in for the npz list (compact mode only).
         if len(npz_files) == 1 and str(npz_files[0]).endswith(".pt"):
             assert compact, "packed .pt libraries are compact-only"
@@ -127,6 +148,10 @@ class MotionLibrary:
                     body_chunks["quat"].append(bq[:, body_idx])
                     body_chunks["lin"].append(blv[:, body_idx])
                     body_chunks["ang"].append(bav[:, body_idx])
+                if "object_pos_w" in d:
+                    obj_chunks.append(
+                        np.concatenate([d["object_pos_w"], d["object_quat_w"], d["object_lin_vel_w"], d["object_ang_vel_w"]], axis=1).astype(np.float32)
+                    )
             clips.append(ClipInfo(Path(f).stem, start, n))
             start += n
         self.clips = clips
@@ -146,6 +171,12 @@ class MotionLibrary:
             self.body_ang_vel_w = t(body_chunks["ang"])
             del body_chunks
             self.goal_feat = goal_features(self._split(self._ref), q0)
+        # Object reference (all clips or none).
+        self.has_object = len(obj_chunks) > 0
+        if self.has_object:
+            assert not compact and len(obj_chunks) == len(clips), "object clips need full mode and an object in every clip"
+            self._obj = torch.as_tensor(np.concatenate(obj_chunks, 0), dtype=dtype, device=self.device)
+            self.obj_goal_feat = object_goal_features(self._split(self._ref), self.obj(slice(None)))
         else:
             from supermimic.data.motion_convert import load_g1_model
             from supermimic.kinematics.g1_fk import G1Kinematics
@@ -189,6 +220,11 @@ class MotionLibrary:
         i = self._tracked_idx
         return RefBodies(out["pos"][..., i, :], out["quat"][..., i, :], out["lin_vel"][..., i, :], out["ang_vel"][..., i, :])
 
+    def obj(self, frame) -> RefObject:
+        """Object reference state (world, origin-free) at the given frames."""
+        o = self._obj[frame]
+        return RefObject(o[..., 0:3], o[..., 3:7], o[..., 7:10], o[..., 10:13])
+
     # Convenience column accessors (full fp32 copies; prefer ``ref()`` in hot paths).
     @property
     def root_pos_w(self) -> torch.Tensor:
@@ -223,11 +259,16 @@ class MotionLibrary:
     def last_frame_of(self, frame: torch.Tensor) -> torch.Tensor:
         return self.clip_last[self.frame_clip[frame]]
 
-    def goal_window(self, frame: torch.Tensor, k: int) -> torch.Tensor:
-        """(N, k*68) goal features of frames frame..frame+k-1, clamped at the clip end."""
+    def goal_window(self, frame: torch.Tensor, k: int, with_object: bool = False) -> torch.Tensor:
+        """(N, k*68) goal features of frames frame..frame+k-1, clamped at the clip end.
+
+        ``with_object``: (N, k*77), each frame's 68-d features followed by its 9-d object goal feature."""
         last = self.last_frame_of(frame)
         offs = torch.arange(k, device=self.device)
         idx = torch.minimum(frame[:, None] + offs[None, :], last[:, None])  # (N,k)
+        if with_object:
+            per_frame = torch.cat([self.goal_feat[idx], self.obj_goal_feat[idx]], dim=-1)
+            return per_frame.reshape(frame.shape[0], k * (GOAL_FEAT_DIM + OBJ_GOAL_FEAT_DIM))
         if not self.compact:
             return self.goal_feat[idx].reshape(frame.shape[0], k * GOAL_FEAT_DIM)
         feat = goal_features(self.ref(idx.reshape(-1)), self.default_joint_pos)
